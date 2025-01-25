@@ -1,0 +1,162 @@
+#!/usr/bin/env python3
+
+import argparse
+import json
+import queue
+import re
+import sys
+import threading
+import traceback
+import requests
+import serial
+import websocket
+
+class Config:
+    """Daemon configuration parsed from a json file"""
+    def __init__(self, config_filename):
+        # Will throw on file not found or invalid json
+        with open(config_filename, 'r', encoding='utf-8') as config_file:
+            config_json = json.load(config_file)
+
+        self.sign_device = config_json['sign_device']
+        self.sign_baud = int(config_json['sign_baud'])
+        self.sign_timeout = int(config_json['sign_timeout'])
+
+        self.rhusb_device = config_json['rhusb_device']
+        self.rhusb_baud = int(config_json['rhusb_baud'])
+        self.rhusb_timeout = int(config_json['rhusb_timeout'])
+
+        self.pushover_secret = config_json['pushover_secret']
+        self.pushover_device_id = config_json['pushover_device_id']
+        self.loop_delay = int(config_json['loop_delay'])
+
+class DoorSignDaemon:
+    def __init__(self, config):
+        self.config = config
+        self.message_queue = queue.Queue()
+        self.pushover_condition = threading.Condition()
+        self.pushover_exit_type = None
+
+    def websocket_thread(self):
+        def on_open(socket):
+            socket.send(f'login:{self.config.pushover_device_id}:{self.config.pushover_secret}\n')
+
+        def on_message(socket, data):
+            message = data.decode('utf-8')
+            if message == '!':
+                with self.pushover_condition:
+                    self.pushover_condition.notify()
+
+            elif message == 'R':
+                self.pushover_exit_type = 'reconnect'
+                socket.close()
+
+            elif message == 'E':
+                self.pushover_exit_type = 'error'
+                socket.close()
+
+        def on_error(_, ex):
+            self.pushover_exit_type = 'exception'
+            print(ex)
+
+        while True:
+            websocket.WebSocketApp('wss://client.pushover.net/push',
+                                   on_message=on_message,
+                                   on_error=on_error,
+                                   on_open=on_open).run_forever()
+
+            if self.pushover_exit_type != 'restart':
+                break
+
+    def serial_thread(self):
+        temperature_regex = re.compile(r'^>?(?P<temperature>\d+\.\d) C\r$')
+        humidity_regex = re.compile(r'^>?(?P<humidity>\d+\.\d) %RH\r$')
+        rhusb_port = serial.serial_for_url(self.config.rhusb_device,
+                                           baudrate=self.config.rhusb_baud,
+                                           timeout=self.config.rhusb_timeout,
+                                           do_not_open=True)
+        sign_port = serial.serial_for_url(self.config.sign_device,
+                                          baudrate=self.config.sign_baud,
+                                          timeout=self.config.sign_timeout,
+                                          do_not_open=True)
+
+        while True:
+            try:
+                location = self.message_queue.get(timeout=self.config.loop_delay)
+                with sign_port as port:
+                    port.write(f'LOC {location}\n'.encode('ascii'))
+            except queue.Empty:
+                temperature = '??'
+                humidity = '??'
+                with rhusb_port as port:
+                    # Retry on corrupted result
+                    for _ in range(3):
+                        if temperature == '??':
+                            try:
+                                port.write(b'C\r')
+                                match = temperature_regex.match(port.readline().decode('ascii'))
+                                if match:
+                                    temperature = str(int(round(float(match.group('temperature')), 0)))
+                            except Exception:
+                                pass
+
+                        if humidity == '??':
+                            try:
+                                port.write(b'H\r')
+                                match = humidity_regex.match(port.readline().decode('ascii'))
+                                if match:
+                                    humidity = str(int(round(float(match.group('humidity')), 0)))
+                            except Exception:
+                                pass
+
+                        if temperature != '??' and humidity != '??':
+                            break
+
+                try:
+                    with sign_port as port:
+                        port.write(f'TH {temperature} {humidity}\n'.encode('ascii'))
+                except Exception:
+                    pass
+
+    def run(self):
+        threading.Thread(target=self.serial_thread, daemon=True).start()
+        threading.Thread(target=self.websocket_thread, daemon=True).start()
+
+        while True:
+            with self.pushover_condition:
+                self.pushover_condition.wait()
+                try:
+                    response = requests.get('https://api.pushover.net/1/messages.json', params={
+                        "secret": self.config.pushover_secret,
+                        "device_id": self.config.pushover_device_id
+                    })
+                    response.raise_for_status()
+
+                    data = response.json()
+                except Exception:
+                    traceback.print_exc(file=sys.stdout)
+                    data = None
+
+                last_message_id = None
+                if data.get('status', 0) != 0:
+                    for message in data.get('messages', {}):
+                        last_message_id = message['id_str']
+                        self.message_queue.put(message['message'])
+
+                if last_message_id is not None:
+                    try:
+                        response = requests.post(
+                            'https://api.pushover.net/1/devices/' +
+                            self.config.pushover_device_id + '/update_highest_message.json',
+                            params={"secret": self.config.pushover_secret, "message": last_message_id})
+                        response.raise_for_status()
+                    except Exception:
+                        traceback.print_exc(file=sys.stdout)
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Door sign server')
+    parser.add_argument('config', help='Path to configuration json file')
+    args = parser.parse_args()
+
+    DoorSignDaemon(Config(args.config)).run()
